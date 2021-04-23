@@ -1,5 +1,6 @@
 package com.ovoenergy.natchez.extras.datadog
 
+import cats.Monad
 import cats.effect.kernel.Ref
 import cats.effect.std.{Queue, Semaphore}
 import cats.effect.{Async, Concurrent, Resource, Sync}
@@ -31,6 +32,19 @@ object Datadog {
     builder.withPrinter(Printer.noSpaces.copy(dropNullValues = true)).build.jsonEncoderOf[F, A]
 
   /**
+   * Take items from the queue until it blocks
+   * TODO I feel this must exist in FS2 somewhere
+   */
+  private def takeWhileAvailable[F[_]: Monad, A](queue: Queue[F, A], max: Int): F[Vector[A]] =
+    Monad[F].tailRecM[Vector[A], Vector[A]](Vector.empty) { list =>
+      queue.tryTake.map {
+        case None => Right(list)
+        case Some(item) if list.length >= max - 1 => Right(list :+ item)
+        case Some(item) => Left(list :+ item)
+      }
+    }
+
+  /**
    * Submit one list of traces to DataDog
    * we group them up by trace ID but I don't think this is actually required,
    * in that you can submit new spans for existing traces across multiple requests
@@ -42,28 +56,28 @@ object Datadog {
     logger: Logger,
     agentHost: Uri
   ): F[Unit] = {
-    Stream
-      .fromQueueUnterminated(queue)
-      .compile
-      .toList
-      .flatMap { traces =>
-        Sync[F].attempt(
-          client.status(
-            Request[F](uri = agentHost.withPath(unsafeFromString("/v0.3/traces")), method = PUT)
-              .withHeaders("X-DataDog-Trace-Count" -> traces.length.toString)
-              withEntity(traces.groupBy(_.traceId).values.toList)
+      takeWhileAvailable(queue, max = 1000)
+      .flatMap {
+        case Vector() =>
+          Sync[F].unit
+        case traces =>
+          Sync[F].attempt(
+            client.status(
+              Request[F](uri = agentHost.withPath(unsafeFromString("/v0.3/traces")), method = PUT)
+                .withHeaders("X-DataDog-Trace-Count" -> traces.length.toString)
+                withEntity(traces.groupBy(_.traceId).values.toList)
+            )
           )
-        )
-        .flatMap {
-          case Left(exception) =>
-            Sync[F].delay(logger.warn("Failed to submit to Datadog", exception))
-          case Right(status) if !status.isSuccess =>
-            Sync[F].delay(logger.warn(s"Got $status from Datadog agent"))
-          case Right(status) =>
-            Sync[F].delay(logger.debug(s"Got $status from Datadog agent"))
-        }
+          .flatMap {
+            case Left(exception) =>
+              Sync[F].delay(logger.warn("Failed to submit to Datadog", exception))
+            case Right(status) if !status.isSuccess =>
+              Sync[F].delay(logger.warn(s"Got $status from Datadog agent"))
+            case Right(status) =>
+              Sync[F].delay(logger.debug(s"Got $status from Datadog agent"))
+          }
       }
-      .as(())
+        .as(())
   }
 
   /**
@@ -114,9 +128,7 @@ object Datadog {
       new EntryPoint[F] {
         def root(name: String): Resource[F, Span[F]] =
           Resource
-            .eval(
-              SpanIdentifiers.create.flatMap(Ref.of[F, SpanIdentifiers])
-            )
+            .eval(SpanIdentifiers.create.flatMap(Ref.of[F, SpanIdentifiers]))
             .flatMap(DatadogSpan.create(queue, names(name)))
             .widen
 
