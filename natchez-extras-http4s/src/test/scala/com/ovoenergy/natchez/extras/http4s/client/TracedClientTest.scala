@@ -1,20 +1,18 @@
 package com.ovoenergy.natchez.extras.http4s.client
 
 import cats.data.Kleisli
-import cats.effect.{IO, Timer}
-import com.ovoenergy.natchez.extras.testkit.TestEntryPoint.TestSpan
+import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 import com.ovoenergy.natchez.extras.http4s.Configuration
 import com.ovoenergy.natchez.extras.testkit.TestEntryPoint
+import com.ovoenergy.natchez.extras.testkit.TestEntryPoint.TestSpan
 import natchez.{Kernel, Span}
 import org.http4s.Request
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 
-import scala.concurrent.ExecutionContext.global
-
 class TracedClientTest extends AnyWordSpec with Matchers {
 
-  implicit val timer: Timer[IO] = IO.timer(global)
   val unit: Kleisli[IO, Span[IO], Unit] = Kleisli.pure(())
   val config: Configuration[IO] = Configuration.default[IO]()
   type TraceIO[A] = Kleisli[IO, Span[IO], A]
@@ -34,7 +32,7 @@ class TracedClientTest extends AnyWordSpec with Matchers {
         } yield reqs
       ).unsafeRunSync()
 
-      requests.forall(_.headers.exists(_.name.value === "X-Trace-Token")) shouldBe true
+      requests.forall(_.headers.headers.exists(_.name.equals("X-Trace-Token"))) shouldBe true
     }
 
     "Create a new span for HTTP requests" in {

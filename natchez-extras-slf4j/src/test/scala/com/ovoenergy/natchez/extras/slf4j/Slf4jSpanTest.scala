@@ -1,21 +1,18 @@
 package com.ovoenergy.natchez.extras.slf4j
 
-import cats.effect.{Concurrent, ContextShift, IO}
-import cats.syntax.flatMap._
+import cats.effect.{Concurrent, IO}
 import natchez.Kernel
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 import uk.org.lidalia.slf4jtest.{LoggingEvent, TestLoggerFactory}
+import cats.effect.unsafe.implicits.global
 
-import scala.concurrent.ExecutionContext
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 
 class Slf4jSpanTest extends AnyWordSpec with Matchers with BeforeAndAfterEach {
 
-  implicit val cs: ContextShift[IO] =
-    IO.contextShift(ExecutionContext.global)
 
   override def beforeEach(): Unit =
     TestLoggerFactory.clearAll()

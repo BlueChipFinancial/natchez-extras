@@ -1,20 +1,20 @@
 package com.ovoenergy.natchez.extras.datadog
 
-import cats.effect.concurrent.{Ref, Semaphore}
-import cats.effect.{Clock, Concurrent, Resource, Sync, Timer}
+import cats.effect.kernel.Ref
+import cats.effect.std.{Queue, Semaphore}
+import cats.effect.{Async, Concurrent, Resource, Sync}
 import cats.syntax.flatMap._
 import cats.syntax.functor._
-import cats.syntax.traverse._
 import com.ovoenergy.natchez.extras.datadog.DatadogSpan.SpanNames
 import fs2.Stream
-import fs2.concurrent.Queue
 import io.circe.{Encoder, Printer}
 import natchez.{EntryPoint, Kernel, Span}
 import org.http4s.Method.PUT
+import org.http4s.Uri.Path.unsafeFromString
 import org.http4s.circe.CirceInstances.builder
 import org.http4s.client.Client
 import org.http4s.syntax.literals._
-import org.http4s.{EntityEncoder, Header, Request, Uri}
+import org.http4s.{EntityEncoder, Request, Uri}
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.duration._
@@ -25,7 +25,7 @@ object Datadog {
     Sync[F].delay(LoggerFactory.getLogger(getClass.getName))
 
   private def spanQueue[F[_]: Concurrent]: Resource[F, Queue[F, SubmittableSpan]] =
-    Resource.eval(Queue.circularBuffer[F, SubmittableSpan](maxSize = 1000))
+    Resource.eval(Queue.circularBuffer[F, SubmittableSpan](capacity = 1000))
 
   private implicit def encoder[F[_], A: Encoder]: EntityEncoder[F, A] =
     builder.withPrinter(Printer.noSpaces.copy(dropNullValues = true)).build.jsonEncoderOf[F, A]
@@ -41,37 +41,37 @@ object Datadog {
     client: Client[F],
     logger: Logger,
     agentHost: Uri
-  ): F[Unit] =
-    queue
-      .tryDequeueChunk1(maxSize = 1000)
-      .flatMap { items =>
-        items.traverse { traces =>
-          Sync[F]
-            .attempt(
-              client.status(
-                Request[F](uri = agentHost.withPath("/v0.3/traces"), method = PUT)
-                  .withHeaders(Header("X-DataDog-Trace-Count", traces.size.toString))
-                  .withEntity(traces.toList.groupBy(_.traceId).values.toList)
-              )
-            )
-            .flatMap {
-              case Left(exception) =>
-                Sync[F].delay(logger.warn("Failed to submit to Datadog", exception))
-              case Right(status) if !status.isSuccess =>
-                Sync[F].delay(logger.warn(s"Got $status from Datadog agent"))
-              case Right(status) =>
-                Sync[F].delay(logger.debug(s"Got $status from Datadog agent"))
-            }
+  ): F[Unit] = {
+    Stream
+      .fromQueueUnterminated(queue)
+      .compile
+      .toList
+      .flatMap { traces =>
+        Sync[F].attempt(
+          client.status(
+            Request[F](uri = agentHost.withPath(unsafeFromString("/v0.3/traces")), method = PUT)
+              .withHeaders("X-DataDog-Trace-Count" -> traces.length.toString)
+              withEntity(traces.groupBy(_.traceId).values.toList)
+          )
+        )
+        .flatMap {
+          case Left(exception) =>
+            Sync[F].delay(logger.warn("Failed to submit to Datadog", exception))
+          case Right(status) if !status.isSuccess =>
+            Sync[F].delay(logger.warn(s"Got $status from Datadog agent"))
+          case Right(status) =>
+            Sync[F].delay(logger.debug(s"Got $status from Datadog agent"))
         }
       }
       .as(())
+  }
 
   /**
    * Process to poll the queue and submit items to Datadog periodically,
    * either every 5 items or every 10 seconds, doing this in here is perhaps a bit cheeky.
    * we do one final submit after cancelling the process to drain the queue
    */
-  private def submitter[F[_]: Concurrent: Timer](
+  private def submitter[F[_]: Async](
     http: Client[F],
     agent: Uri,
     queue: Queue[F, SubmittableSpan]
@@ -100,7 +100,7 @@ object Datadog {
    * kicks off the async publishing process. We don't quite adhere to the spirit of these functions
    * in that `continue` always succeeds but does its best to recreate the trace from HTTP
    */
-  def entryPoint[F[_]: Concurrent: Timer: Clock](
+  def entryPoint[F[_]: Async](
     client: Client[F],
     service: String,
     resource: String,
